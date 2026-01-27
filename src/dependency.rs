@@ -7,6 +7,9 @@ use std::process::Command;
 use fs2::FileExt;
 use std::fs::File;
 
+use std::time::Duration;
+use std::thread::sleep;
+
 /// Well-known CUTLASS repository configuration
 const CUTLASS_REPO: &str = "https://github.com/NVIDIA/cutlass.git";
 const CUTLASS_DEFAULT_COMMIT: &str = "7127592069c2fe01b041e174ba4345ef9b279671";
@@ -14,13 +17,81 @@ const CUTLASS_INCLUDE_PATHS: &[&str] = &["include", "tools/util/include"];
 
 fn acquire_lock(dep_dir: &PathBuf) -> Result<File> {
     let lock_path = dep_dir.join(".lock");
-    let file = File::create(&lock_path).map_err(|e| {
-        Error::GitOperationFailed(format!("Failed to create lock file {}: {}", lock_path.display(), e))
-    })?;
-    file.lock_exclusive().map_err(|e| {
-        Error::GitOperationFailed(format!("Failed to acquire lock on {}: {}", lock_path.display(), e))
-    })?;
-    Ok(file)
+
+    // Try to acquire lock with exponential backoff
+    let mut attempts = 0;
+    let max_attempts = 10;
+    let mut delay = Duration::from_millis(100);
+
+    loop {
+        match File::create(&lock_path) {
+            Ok(file) => {
+                match file.try_lock_exclusive() {
+                    Ok(()) => {
+                        // Successfully acquired lock
+                        println!("cargo:warning=Acquired lock on {}", lock_path.display());
+                        return Ok(file);
+                    }
+                    Err(e) => {
+                        // Lock is held — check if it's stale
+                        if let Some(stale) = is_stale_lock(&lock_path) {
+                            println!("cargo:warning=Detected stale lock on {}, removing...", lock_path.display());
+                            if let Err(e) = std::fs::remove_file(&lock_path) {
+                                println!("cargo:warning=Failed to remove stale lock: {}", e);
+                            } else {
+                                // Retry immediately after cleanup
+                                continue;
+                            }
+                        }
+
+                        // Wait before retrying
+                        if attempts >= max_attempts {
+                            return Err(Error::GitOperationFailed(format!(
+                                "Failed to acquire lock on {} after {} attempts: {}",
+                                lock_path.display(),
+                                max_attempts,
+                                e
+                            )));
+                        }
+
+                        println!("cargo:warning=Lock held on {}, waiting {}ms...", lock_path.display(), delay.as_millis());
+                        sleep(delay);
+                        delay = delay.saturating_mul(2); // Exponential backoff
+                        attempts += 1;
+                    }
+                }
+            }
+            Err(e) => {
+                return Err(Error::GitOperationFailed(format!(
+                    "Failed to create lock file {}: {}",
+                    lock_path.display(),
+                    e
+                )));
+            }
+        }
+    }
+}
+
+/// Check if the lock file is stale (held by a dead process)
+fn is_stale_lock(lock_path: &PathBuf) -> Option<bool> {
+    // On Unix, we can check if the lock is held by a dead process via fcntl
+    // But `fs2` doesn't expose that. So we use a heuristic:
+    // - If the lock file exists but hasn't been modified in > 15 minutes, assume stale.
+    // - Or, if we can't acquire it and the file is old, assume stale.
+
+    if let Ok(metadata) = std::fs::metadata(lock_path) {
+        if let Ok(modified) = metadata.modified() {
+            let now = std::time::SystemTime::now();
+            if let Ok(duration) = now.duration_since(modified) {
+                // If lock file hasn't been touched in 15 minutes, consider it stale
+                if duration > Duration::from_secs(15 * 60) {
+                    return Some(true);
+                }
+            }
+        }
+    }
+
+    Some(false)
 }
 
 /// External dependency configuration
