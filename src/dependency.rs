@@ -4,10 +4,24 @@ use crate::error::{Error, Result};
 use std::path::PathBuf;
 use std::process::Command;
 
+use fs2::FileExt;
+use std::fs::File;
+
 /// Well-known CUTLASS repository configuration
 const CUTLASS_REPO: &str = "https://github.com/NVIDIA/cutlass.git";
 const CUTLASS_DEFAULT_COMMIT: &str = "7127592069c2fe01b041e174ba4345ef9b279671";
 const CUTLASS_INCLUDE_PATHS: &[&str] = &["include", "tools/util/include"];
+
+fn acquire_lock(dep_dir: &PathBuf) -> Result<File> {
+    let lock_path = dep_dir.join(".lock");
+    let file = File::create(&lock_path).map_err(|e| {
+        Error::GitOperationFailed(format!("Failed to create lock file {}: {}", lock_path.display(), e))
+    })?;
+    file.lock_exclusive().map_err(|e| {
+        Error::GitOperationFailed(format!("Failed to acquire lock on {}: {}", lock_path.display(), e))
+    })?;
+    Ok(file)
+}
 
 /// External dependency configuration
 #[derive(Debug, Clone)]
@@ -59,6 +73,8 @@ impl ExternalDependency {
         let commit_prefix = &self.commit[..16.min(self.commit.len())];
         let cache_key = format!("{}-{}", self.name, commit_prefix);
         let dep_dir = cache_dir.join(&cache_key);
+        // Released when File goes out of scope
+        let _lock = acquire_lock(&dep_dir)?;
 
         // Check if already at correct commit
         if dep_dir.join("include").exists() {
