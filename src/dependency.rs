@@ -9,6 +9,7 @@ use std::fs::File;
 
 use std::time::Duration;
 use std::thread::sleep;
+use std::collections::HashSet;
 
 /// Well-known CUTLASS repository configuration
 const CUTLASS_REPO: &str = "https://github.com/NVIDIA/cutlass.git";
@@ -95,7 +96,7 @@ fn is_stale_lock(lock_path: &PathBuf) -> Option<bool> {
 }
 
 /// External dependency configuration
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Eq, Hash, PartialEq)]
 pub struct ExternalDependency {
     /// Name of the dependency
     pub name: String,
@@ -301,7 +302,7 @@ impl ExternalDependency {
 /// Dependency manager for handling multiple external dependencies
 #[derive(Debug, Clone, Default)]
 pub struct DependencyManager {
-    dependencies: Vec<ExternalDependency>,
+    dependencies: HashSet<ExternalDependency>,
     local_includes: Vec<PathBuf>,
 }
 
@@ -313,7 +314,7 @@ impl DependencyManager {
 
     /// Add CUTLASS dependency
     pub fn with_cutlass(mut self, commit: Option<&str>) -> Self {
-        self.dependencies.push(ExternalDependency::cutlass(commit));
+        self.dependencies.insert(ExternalDependency::cutlass(commit));
         self
     }
 
@@ -326,7 +327,7 @@ impl DependencyManager {
         include_paths: Vec<&str>,
     ) -> Self {
         self.dependencies
-            .push(ExternalDependency::git(name, repo, commit, include_paths));
+            .insert(ExternalDependency::git(name, repo, commit, include_paths));
         self
     }
 
