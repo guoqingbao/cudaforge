@@ -74,7 +74,8 @@ impl GpuArch {
     /// async/accelerated features. This is the recommended default.
     pub fn auto_suffix(base: usize) -> Self {
         match base {
-            b if b >= 90 => Self::with_suffix(b, "a"),
+            b if b >= 120 => Self::with_suffix(b, "f"),
+            b if b >= 90 && b < 120 => Self::with_suffix(b, "a"),
             b => Self::new(b),
         }
     }
