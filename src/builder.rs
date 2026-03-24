@@ -354,18 +354,18 @@ impl KernelBuilder {
                 .unwrap_or("");
             let gpu_arch = self.compute_cap.get_for_file(filename)?;
 
-            // Generate unique object file name
-            let obj_file = self.object_file_path(kernel_file);
+            // Compute content hash before deriving the object path so that
+            // distinct source versions (e.g. the same file on different git branches)
+            // each get their own .o file in the shared cache.
+            let content_hash = crate::hash::hash_file(kernel_file).unwrap_or_default();
+
+            // Generate unique object file name (encodes content + args + arch)
+            let obj_file =
+                self.object_file_path(kernel_file, &content_hash, &args_hash, &gpu_arch.to_nvcc_arch());
             all_obj_files.push(obj_file.clone());
 
-            if self.incremental
-                && !cache.needs_rebuild(
-                    kernel_file,
-                    &obj_file,
-                    &gpu_arch.to_nvcc_arch(),
-                    &args_hash,
-                )
-            {
+            // obj path encodes (content, args, arch) — if it exists, it's valid.
+            if self.incremental && obj_file.exists() {
                 continue;
             }
 
@@ -625,10 +625,24 @@ impl KernelBuilder {
         })
     }
 
-    /// Generate unique object file path for a kernel
-    fn object_file_path(&self, kernel_file: &Path) -> PathBuf {
+    /// Generate unique object file path for a kernel.
+    ///
+    /// The path encodes (source path, content hash, args hash, gpu arch) so that
+    /// different branches/configs each get their own .o file in the shared cache.
+    /// This prevents the ping-pong recompilation that occurs when two branches have
+    /// different versions of the same file and share a single cache entry + .o path.
+    fn object_file_path(
+        &self,
+        kernel_file: &Path,
+        content_hash: &str,
+        args_hash: &str,
+        gpu_arch: &str,
+    ) -> PathBuf {
         let mut hasher = DefaultHasher::new();
         kernel_file.display().to_string().hash(&mut hasher);
+        content_hash.hash(&mut hasher);
+        args_hash.hash(&mut hasher);
+        gpu_arch.hash(&mut hasher);
         let hash = hasher.finish();
 
         let stem = kernel_file
