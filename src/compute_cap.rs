@@ -39,8 +39,10 @@ impl GpuArch {
         // Strip "sm_" prefix if present
         let s = s.strip_prefix("sm_").unwrap_or(&s);
 
-        // Check for suffix (letters at the end)
-        let (num_part, explicit_suffix) = if s.ends_with('a') {
+        // Check for suffix (letters at the end) - support 'a' and 'f' suffixes
+        let (num_part, explicit_suffix) = if s.ends_with('f') {
+            (&s[..s.len() - 1], Some("f".to_string()))
+        } else if s.ends_with('a') {
             (&s[..s.len() - 1], Some("a".to_string()))
         } else {
             (s.as_ref(), None)
