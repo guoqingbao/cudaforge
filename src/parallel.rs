@@ -90,10 +90,11 @@ impl ParallelConfig {
             if pattern.contains('*') || pattern.contains('?') || pattern.contains('[') {
                 if let Ok(compiled) = Pattern::new(pattern) {
                     // 1. Try matching against the filename component (if pattern has no path separators)
-                    if !pattern.contains('/') && !pattern.contains('\\') {
-                        if compiled.matches(filename_component) {
-                            return true;
-                        }
+                    if !pattern.contains('/')
+                        && !pattern.contains('\\')
+                        && compiled.matches(filename_component)
+                    {
+                        return true;
                     }
 
                     // 2. Try matching against the full path

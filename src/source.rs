@@ -5,7 +5,7 @@ use std::path::{Path, PathBuf};
 use walkdir::WalkDir;
 
 /// Source file selection configuration
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct SourceSelector {
     /// Included files/directories
     includes: Vec<SourcePath>,
@@ -21,16 +21,6 @@ enum SourcePath {
     File(PathBuf),
     Directory(PathBuf),
     Glob(String),
-}
-
-impl Default for SourceSelector {
-    fn default() -> Self {
-        Self {
-            includes: Vec::new(),
-            excludes: Vec::new(),
-            watch_paths: Vec::new(),
-        }
-    }
 }
 
 impl SourceSelector {
@@ -124,7 +114,7 @@ impl SourceSelector {
                     SourcePath::Glob(pattern) => {
                         if let Ok(entries) = glob::glob(pattern) {
                             for entry in entries.flatten() {
-                                if entry.extension().map_or(false, |e| e == "cu")
+                                if entry.extension().is_some_and(|e| e == "cu")
                                     && !self.is_excluded(&entry)
                                 {
                                     files.push(entry);
@@ -150,10 +140,11 @@ impl SourceSelector {
     fn collect_from_directory(&self, dir: &Path, files: &mut Vec<PathBuf>) -> Result<()> {
         for entry in WalkDir::new(dir).into_iter().filter_map(|e| e.ok()) {
             let path = entry.path();
-            if path.is_file() && path.extension().map_or(false, |e| e == "cu") {
-                if !self.is_excluded(path) {
-                    files.push(path.to_path_buf());
-                }
+            if path.is_file()
+                && path.extension().is_some_and(|e| e == "cu")
+                && !self.is_excluded(path)
+            {
+                files.push(path.to_path_buf());
             }
         }
         Ok(())
@@ -192,11 +183,11 @@ fn matches_exclusion_pattern(filename: &str, path_str: &str, pattern: &str) -> b
             let (prefix, suffix) = (parts[0], parts[1]);
             return filename.starts_with(prefix) && filename.ends_with(suffix);
         }
-        if pattern.starts_with('*') {
-            return filename.ends_with(&pattern[1..]);
+        if let Some(stripped) = pattern.strip_prefix('*') {
+            return filename.ends_with(stripped);
         }
-        if pattern.ends_with('*') {
-            return filename.starts_with(&pattern[..pattern.len() - 1]);
+        if let Some(stripped) = pattern.strip_suffix('*') {
+            return filename.starts_with(stripped);
         }
     }
 

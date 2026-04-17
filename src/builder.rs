@@ -3,7 +3,7 @@
 use crate::compute_cap::{ComputeCapability, GpuArch};
 use crate::dependency::DependencyManager;
 use crate::error::{Error, Result};
-use crate::hash::{hash_args, BuildCache};
+use crate::hash::{hash_args, hash_paths, BuildCache};
 use crate::parallel::ParallelConfig;
 use crate::source::SourceSelector;
 use crate::toolkit::CudaToolkit;
@@ -343,6 +343,9 @@ impl KernelBuilder {
         all_args.extend(dep_args.clone());
         let args_hash = hash_args(&all_args);
 
+        // Calculate watch hash for cache
+        let watch_hash = hash_paths(self.sources.watch_paths());
+
         // Determine which files need compilation
         let mut compile_jobs: Vec<(PathBuf, PathBuf, GpuArch)> = Vec::new();
         let mut all_obj_files: Vec<PathBuf> = Vec::new();
@@ -364,6 +367,7 @@ impl KernelBuilder {
                     &obj_file,
                     &gpu_arch.to_nvcc_arch(),
                     &args_hash,
+                    &watch_hash,
                 )
             {
                 continue;
@@ -373,7 +377,7 @@ impl KernelBuilder {
         }
 
         if compile_jobs.is_empty() && out_file.exists() {
-            println!("cargo:warning=All kernels up-to-date, skipping compilation");
+            println!("cargo:warning=All library kernels up-to-date, skipping compilation");
             return Ok(());
         }
 
@@ -385,7 +389,7 @@ impl KernelBuilder {
 
         // Get target info
         let target = std::env::var("TARGET").ok();
-        let is_msvc = target.as_ref().map_or(false, |t| t.contains("msvc"));
+        let is_msvc = target.as_ref().is_some_and(|t| t.contains("msvc"));
         let ccbin_env = std::env::var("NVCC_CCBIN").ok();
         let nvcc_threads = self.parallel.nvcc_threads();
 
@@ -475,7 +479,13 @@ impl KernelBuilder {
         // Update cache for compiled files
         if self.incremental {
             for (kernel_file, obj_file, gpu_arch) in &compile_jobs {
-                cache.update(kernel_file, obj_file, &gpu_arch.to_nvcc_arch(), &args_hash)?;
+                cache.update(
+                    kernel_file,
+                    obj_file,
+                    &gpu_arch.to_nvcc_arch(),
+                    &args_hash,
+                    &watch_hash,
+                )?;
             }
             cache.save(&self.out_dir)?;
         }
@@ -536,35 +546,58 @@ impl KernelBuilder {
         let dep_args = self.dependencies.fetch_all(&self.out_dir)?;
         let ccbin_env = std::env::var("NVCC_CCBIN").ok();
         let nvcc_threads = self.parallel.nvcc_threads();
+        let watch_hash = hash_paths(self.sources.watch_paths());
+        let mut cache = BuildCache::load(&self.out_dir);
 
-        kernel_files
-            .par_iter()
-            .try_for_each(|kernel_file| -> Result<()> {
-                let filename = kernel_file
-                    .file_name()
-                    .and_then(|n| n.to_str())
-                    .unwrap_or("");
-                let gpu_arch = self.compute_cap.get_for_file(filename)?;
+        let mut all_args = self.extra_args.clone();
+        all_args.extend(dep_args.clone());
+        let args_hash = hash_args(&all_args);
 
-                let output_file = self
-                    .out_dir
-                    .join(kernel_file.with_extension("ptx").file_name().unwrap());
+        let mut compile_jobs = Vec::new();
+        for kernel_file in &kernel_files {
+            let filename = kernel_file
+                .file_name()
+                .and_then(|n| n.to_str())
+                .unwrap_or("");
+            let gpu_arch = self.compute_cap.get_for_file(filename)?;
 
-                // Check if output is current
-                if output_file.exists() {
-                    if let (Ok(out_meta), Ok(in_meta)) =
-                        (output_file.metadata(), kernel_file.metadata())
-                    {
-                        if let (Ok(out_time), Ok(in_time)) =
-                            (out_meta.modified(), in_meta.modified())
-                        {
-                            if out_time.duration_since(in_time).is_ok() {
-                                return Ok(());
-                            }
-                        }
-                    }
-                }
+            let output_file = self
+                .out_dir
+                .join(kernel_file.with_extension("ptx").file_name().unwrap());
 
+            // Check if output is current using BuildCache
+            if self.incremental
+                && !cache.needs_rebuild(
+                    kernel_file,
+                    &output_file,
+                    &gpu_arch.to_nvcc_arch(),
+                    &args_hash,
+                    &watch_hash,
+                )
+            {
+                continue;
+            }
+
+            compile_jobs.push((kernel_file, output_file, gpu_arch));
+        }
+
+        if compile_jobs.is_empty() {
+            println!("cargo:warning=All PTX kernels up-to-date, skipping compilation");
+            return Ok(PtxOutput {
+                paths: kernel_files,
+                out_dir: self.out_dir.clone(),
+            });
+        }
+
+        println!(
+            "cargo:warning=Compiling {} of {} PTX kernels",
+            compile_jobs.len(),
+            kernel_files.len()
+        );
+
+        // Compile in parallel
+        compile_jobs.par_iter().try_for_each(
+            |(kernel_file, _output_file, gpu_arch)| -> Result<()> {
                 let gencode_arg = gpu_arch.to_gencode_arg();
 
                 let mut command = Command::new(&toolkit.nvcc_path);
@@ -601,13 +634,13 @@ impl KernelBuilder {
                     .map_err(|e| Error::NvccNotFound(format!("Failed to spawn nvcc: {}", e)))?
                     .wait_with_output()
                     .map_err(|e| Error::CompilationFailed {
-                        path: kernel_file.clone(),
+                        path: kernel_file.to_path_buf(),
                         message: e.to_string(),
                     })?;
 
                 if !output.status.success() {
                     return Err(Error::CompilationFailed {
-                        path: kernel_file.clone(),
+                        path: kernel_file.to_path_buf(),
                         message: format!(
                             "nvcc error:\n{}\n{}",
                             String::from_utf8_lossy(&output.stdout),
@@ -617,7 +650,31 @@ impl KernelBuilder {
                 }
 
                 Ok(())
-            })?;
+            },
+        )?;
+
+        // Update cache for PTX files
+        if self.incremental {
+            for kernel_file in &kernel_files {
+                let filename = kernel_file
+                    .file_name()
+                    .and_then(|n| n.to_str())
+                    .unwrap_or("");
+                let gpu_arch = self.compute_cap.get_for_file(filename)?;
+                let output_file = self
+                    .out_dir
+                    .join(kernel_file.with_extension("ptx").file_name().unwrap());
+
+                cache.update(
+                    kernel_file,
+                    &output_file,
+                    &gpu_arch.to_nvcc_arch(),
+                    &args_hash,
+                    &watch_hash,
+                )?;
+            }
+            cache.save(&self.out_dir)?;
+        }
 
         Ok(PtxOutput {
             paths: kernel_files,
@@ -667,5 +724,81 @@ impl PtxOutput {
         }
 
         Ok(())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use std::fs;
+    use std::time::Duration;
+
+    #[test]
+    fn test_incremental_rebuild_on_header_change() {
+        // Skip test if nvcc is not available (e.g. in some CI environments)
+        if crate::toolkit::CudaToolkit::detect().is_err() {
+            return;
+        }
+
+        // Use a semi-unique directory in the system temp folder
+        let mut root = std::env::temp_dir();
+        root.push(format!("cudaforge-test-{}", std::process::id()));
+
+        // Ensure clean state
+        if root.exists() {
+            let _ = fs::remove_dir_all(&root);
+        }
+        fs::create_dir_all(&root).unwrap();
+
+        let out_dir = root.join("out");
+        let src_dir = root.join("src");
+        fs::create_dir_all(&out_dir).unwrap();
+        fs::create_dir_all(&src_dir).unwrap();
+
+        let cu_file = src_dir.join("kernel.cu");
+        let cuh_file = src_dir.join("header.cuh");
+        let lib_file = out_dir.join("libkernels.a");
+
+        // Create initial version
+        fs::write(
+            &cu_file,
+            "#include \"header.cuh\"\nextern \"C\" __global__ void add() {}",
+        )
+        .unwrap();
+        fs::write(&cuh_file, "// version 1").unwrap();
+
+        let builder = KernelBuilder::new()
+            .source_files(vec![&cu_file])
+            .watch(vec![&cuh_file])
+            .out_dir(&out_dir);
+
+        // First build
+        builder.build_lib(&lib_file).expect("First build failed");
+        let mtime1 = fs::metadata(&lib_file)
+            .expect("Lib file should exist")
+            .modified()
+            .unwrap();
+
+        std::thread::sleep(Duration::from_millis(1100));
+
+        // Modify the watched header
+        fs::write(&cuh_file, "// version 2").unwrap();
+
+        // Second build - should trigger recompilation
+        builder.build_lib(&lib_file).expect("Second build failed");
+        let mtime2 = fs::metadata(&lib_file)
+            .expect("Lib file should exist after second build")
+            .modified()
+            .unwrap();
+
+        let recompiled = mtime2 > mtime1;
+
+        // Cleanup BEFORE assertion so we don't leave mess on failure
+        let _ = fs::remove_dir_all(&root);
+
+        assert!(
+            recompiled,
+            "Recompilation was NOT triggered by header change!"
+        );
     }
 }

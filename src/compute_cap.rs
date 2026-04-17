@@ -40,10 +40,10 @@ impl GpuArch {
         let s = s.strip_prefix("sm_").unwrap_or(&s);
 
         // Check for suffix (letters at the end)
-        let (num_part, explicit_suffix) = if s.ends_with('a') {
-            (&s[..s.len() - 1], Some("a".to_string()))
+        let (num_part, explicit_suffix) = if let Some(stripped) = s.strip_suffix('a') {
+            (stripped, Some("a".to_string()))
         } else {
-            (s.as_ref(), None)
+            (s, None)
         };
 
         let base = num_part.parse::<usize>().map_err(|_| {
@@ -51,11 +51,7 @@ impl GpuArch {
         })?;
 
         // Normalize (accept both 80 and 8.0 style)
-        let base = if base < 100 && base < 20 {
-            base * 10
-        } else {
-            base
-        };
+        let base = if base < 20 { base * 10 } else { base };
 
         // If explicit suffix provided, use it; otherwise auto-suffix for >=90
         if explicit_suffix.is_some() {
@@ -121,21 +117,12 @@ impl From<usize> for GpuArch {
 }
 
 /// Compute capability configuration
-#[derive(Debug, Clone)]
+#[derive(Debug, Clone, Default)]
 pub struct ComputeCapability {
     /// Default compute cap (auto-detected or manually set)
     default_cap: Option<GpuArch>,
     /// Per-file overrides (filename pattern -> compute cap)
     overrides: HashMap<String, GpuArch>,
-}
-
-impl Default for ComputeCapability {
-    fn default() -> Self {
-        Self {
-            default_cap: None,
-            overrides: HashMap::new(),
-        }
-    }
 }
 
 impl ComputeCapability {
@@ -286,11 +273,11 @@ fn matches_pattern(filename: &str, pattern: &str) -> bool {
         }
 
         // Handle single * at start or end
-        if pattern.starts_with('*') {
-            return filename.ends_with(&pattern[1..]);
+        if let Some(stripped) = pattern.strip_prefix('*') {
+            return filename.ends_with(stripped);
         }
-        if pattern.ends_with('*') {
-            return filename.starts_with(&pattern[..pattern.len() - 1]);
+        if let Some(stripped) = pattern.strip_suffix('*') {
+            return filename.starts_with(stripped);
         }
     }
 
