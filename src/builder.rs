@@ -301,11 +301,15 @@ impl KernelBuilder {
     /// `hybrid` is only valid on Windows targets, while `shared` is not valid on
     /// Windows targets.
     pub fn cudart(mut self, cudart: &str) -> Self {
-        assert!(
-            matches!(cudart, "none" | "shared" | "static" | "hybrid"),
-            "unsupported cudart option: {cudart}"
-        );
-        self.cudart = Some(format!("--cudart={}", cudart));
+        if matches!(cudart, "none" | "shared" | "static" | "hybrid") {
+            self.cudart = Some(format!("--cudart={}", cudart));
+        } else {
+            println!(
+                "cargo:warning=cudaforge: ignoring unknown cudart option '{}', \
+                 expected one of: none, shared, static, hybrid",
+                cudart
+            );
+        }
         self
     }
 
@@ -921,6 +925,12 @@ mod tests {
             KernelBuilder::new().cudart("hybrid").cudart.as_deref(),
             Some("--cudart=hybrid")
         );
+    }
+
+    #[test]
+    fn test_cudart_invalid_ignored() {
+        let builder = KernelBuilder::new().cudart("invalid_option");
+        assert_eq!(builder.cudart, None);
     }
 
     #[test]

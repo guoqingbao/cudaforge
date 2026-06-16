@@ -72,8 +72,8 @@ impl GpuArch {
     /// Architectures >= sm_90 need "a" suffix for async/accelerated features
     pub fn auto_suffix(base: usize) -> Self {
         match base {
-            b if b >= 120 => Self::with_suffix(b, "f"),  // SM120/121 need "f"
-            b if b >= 90 => Self::with_suffix(b, "a"),   // SM90/100/103 need "a"
+            b if b >= 120 => Self::with_suffix(b, "f"), // SM120/121 need "f"
+            b if b >= 90 => Self::with_suffix(b, "a"),  // SM90/100/103 need "a"
             b => Self::new(b),
         }
     }
