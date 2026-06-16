@@ -33,6 +33,10 @@ pub struct KernelBuilder {
     out_dir: PathBuf,
     /// Extra nvcc arguments
     extra_args: Vec<String>,
+    /// Whether nvcc should use the static runtime when compiling host code.
+    static_crt: Option<bool>,
+    /// CUDA runtime linkage passed to nvcc via --cudart, if explicitly configured.
+    cudart: Option<String>,
     /// Whether to use incremental builds
     incremental: bool,
 }
@@ -51,6 +55,8 @@ impl Default for KernelBuilder {
             parallel: ParallelConfig::default(),
             out_dir,
             extra_args: Vec::new(),
+            static_crt: None,
+            cudart: None,
             incremental: true,
         }
     }
@@ -273,6 +279,40 @@ impl KernelBuilder {
         self
     }
 
+    /// Control whether nvcc uses static runtime linkage for host code.
+    ///
+    /// If this is not called, CudaForge follows Rust's target features: targets with
+    /// `crt-static` use static CRT flags, and all other targets use dynamic CRT
+    /// flags where nvcc supports an explicit choice.
+    ///
+    /// On MSVC targets, this controls `/MT` vs `/MD`. On GNU-like targets, static
+    /// CRT linkage adds `-static` for the host compiler.
+    pub fn static_crt(mut self, static_crt: bool) -> Self {
+        self.static_crt = Some(static_crt);
+        self
+    }
+
+    /// Control CUDA runtime linkage passed to nvcc via `--cudart`.
+    ///
+    /// Accepts `none`, `shared`, `static`, or `hybrid`. If this is not called,
+    /// CudaForge does not pass any `--cudart` flag and leaves nvcc's default
+    /// behavior unchanged.
+    ///
+    /// `hybrid` is only valid on Windows targets, while `shared` is not valid on
+    /// Windows targets.
+    pub fn cudart(mut self, cudart: &str) -> Self {
+        if matches!(cudart, "none" | "shared" | "static" | "hybrid") {
+            self.cudart = Some(format!("--cudart={}", cudart));
+        } else {
+            println!(
+                "cargo:warning=cudaforge: ignoring unknown cudart option '{}', \
+                 expected one of: none, shared, static, hybrid",
+                cudart
+            );
+        }
+        self
+    }
+
     /// Disable incremental builds
     pub fn no_incremental(mut self) -> Self {
         self.incremental = false;
@@ -327,9 +367,21 @@ impl KernelBuilder {
         println!("cargo:rerun-if-env-changed=CUDA_COMPUTE_CAP");
         println!("cargo:rerun-if-env-changed=NVCC");
         println!("cargo:rerun-if-env-changed=NVCC_CCBIN");
+        println!("cargo:rerun-if-env-changed=CARGO_CFG_TARGET_FEATURE");
 
         // Fetch external dependencies
         let dep_args = self.dependencies.fetch_all(&self.out_dir)?;
+
+        // Get target info
+        let target = std::env::var("TARGET").ok();
+        self.validate_cudart_for_target(target.as_deref())?;
+        let is_msvc = target.as_ref().is_some_and(|t| t.contains("msvc"));
+        let is_gnu_like = target.as_ref().is_some_and(|t| {
+            t.contains("linux") || t.contains("freebsd") || t.contains("dragonfly")
+        });
+        let ccbin_env = std::env::var("NVCC_CCBIN").ok();
+        let target_features = std::env::var("CARGO_CFG_TARGET_FEATURE").ok();
+        let crt_args = self.nvcc_crt_args(is_msvc, is_gnu_like, target_features.as_deref());
 
         // Load build cache
         let mut cache = if self.incremental {
@@ -341,6 +393,10 @@ impl KernelBuilder {
         // Calculate args hash for cache
         let mut all_args = self.extra_args.clone();
         all_args.extend(dep_args.clone());
+        all_args.extend(crt_args.cache_args());
+        if let Some(cudart) = &self.cudart {
+            all_args.push(cudart.clone());
+        }
         let args_hash = hash_args(&all_args);
 
         // Calculate watch hash for cache
@@ -387,10 +443,6 @@ impl KernelBuilder {
             kernel_files.len()
         );
 
-        // Get target info
-        let target = std::env::var("TARGET").ok();
-        let is_msvc = target.as_ref().is_some_and(|t| t.contains("msvc"));
-        let ccbin_env = std::env::var("NVCC_CCBIN").ok();
         let nvcc_threads = self.parallel.nvcc_threads();
 
         // Compile in parallel
@@ -439,6 +491,10 @@ impl KernelBuilder {
                     command.arg("-Xcompiler").arg("-fPIC");
                 } else {
                     command.arg("-D_USE_MATH_DEFINES");
+                }
+                crt_args.add_to_command(&mut command);
+                if let Some(cudart) = &self.cudart {
+                    command.arg(cudart);
                 }
 
                 // Add nvcc threads for certain files
@@ -695,6 +751,77 @@ impl KernelBuilder {
 
         self.out_dir.join(format!("{}-{:x}.o", stem, hash))
     }
+
+    fn nvcc_crt_args(
+        &self,
+        is_msvc: bool,
+        is_gnu_like: bool,
+        target_features: Option<&str>,
+    ) -> NvccCrtArgs {
+        let static_crt = self
+            .static_crt
+            .unwrap_or_else(|| target_features_contains_crt_static(target_features));
+        NvccCrtArgs::new(static_crt, is_msvc, is_gnu_like)
+    }
+
+    fn validate_cudart_for_target(&self, target: Option<&str>) -> Result<()> {
+        let Some(cudart) = &self.cudart else {
+            return Ok(());
+        };
+
+        let is_windows = target.is_some_and(|target| target.contains("windows"));
+        match cudart.as_str() {
+            "--cudart=shared" if is_windows => Err(Error::InvalidConfig(
+                "CUDA runtime 'shared' is not valid on Windows targets; use 'static' or 'hybrid'"
+                    .to_string(),
+            )),
+            "--cudart=hybrid" if !is_windows => Err(Error::InvalidConfig(
+                "CUDA runtime 'hybrid' is only valid on Windows targets".to_string(),
+            )),
+            _ => Ok(()),
+        }
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct NvccCrtArgs {
+    host_crt: Option<&'static str>,
+}
+
+impl NvccCrtArgs {
+    fn new(static_crt: bool, is_msvc: bool, is_gnu_like: bool) -> Self {
+        let host_crt = if is_msvc {
+            Some(if static_crt { "/MT" } else { "/MD" })
+        } else if static_crt && is_gnu_like {
+            Some("-static")
+        } else {
+            None
+        };
+
+        Self { host_crt }
+    }
+
+    fn cache_args(&self) -> Vec<String> {
+        let mut args = Vec::new();
+        if let Some(host_crt) = self.host_crt {
+            args.push("-Xcompiler".to_string());
+            args.push(host_crt.to_string());
+        }
+        args
+    }
+
+    fn add_to_command(&self, command: &mut Command) {
+        if let Some(host_crt) = self.host_crt {
+            command.arg("-Xcompiler").arg(host_crt);
+        }
+    }
+}
+
+fn target_features_contains_crt_static(target_features: Option<&str>) -> bool {
+    target_features
+        .unwrap_or_default()
+        .split(',')
+        .any(|feature| feature == "crt-static")
 }
 
 /// Output from PTX compilation
@@ -732,6 +859,103 @@ mod tests {
     use super::*;
     use std::fs;
     use std::time::Duration;
+
+    #[test]
+    fn test_nvcc_crt_args_from_explicit_setting() {
+        assert_eq!(
+            KernelBuilder::new()
+                .static_crt(true)
+                .nvcc_crt_args(true, false, None),
+            NvccCrtArgs {
+                host_crt: Some("/MT")
+            }
+        );
+        assert_eq!(
+            KernelBuilder::new()
+                .static_crt(false)
+                .nvcc_crt_args(true, false, Some("crt-static"),),
+            NvccCrtArgs {
+                host_crt: Some("/MD")
+            }
+        );
+    }
+
+    #[test]
+    fn test_nvcc_crt_args_from_target_features() {
+        assert_eq!(
+            KernelBuilder::new().nvcc_crt_args(true, false, Some("crt-static,sse2")),
+            NvccCrtArgs {
+                host_crt: Some("/MT")
+            }
+        );
+        assert_eq!(
+            KernelBuilder::new().nvcc_crt_args(true, false, Some("sse2")),
+            NvccCrtArgs {
+                host_crt: Some("/MD")
+            }
+        );
+        assert_eq!(
+            KernelBuilder::new().nvcc_crt_args(false, true, Some("crt-static")),
+            NvccCrtArgs {
+                host_crt: Some("-static")
+            }
+        );
+        assert_eq!(
+            KernelBuilder::new().nvcc_crt_args(false, true, None),
+            NvccCrtArgs { host_crt: None }
+        );
+    }
+
+    #[test]
+    fn test_cudart_is_explicit_only() {
+        assert_eq!(KernelBuilder::new().cudart, None);
+        assert_eq!(
+            KernelBuilder::new().cudart("shared").cudart.as_deref(),
+            Some("--cudart=shared")
+        );
+        assert_eq!(
+            KernelBuilder::new().cudart("static").cudart.as_deref(),
+            Some("--cudart=static")
+        );
+        assert_eq!(
+            KernelBuilder::new().cudart("none").cudart.as_deref(),
+            Some("--cudart=none")
+        );
+        assert_eq!(
+            KernelBuilder::new().cudart("hybrid").cudart.as_deref(),
+            Some("--cudart=hybrid")
+        );
+    }
+
+    #[test]
+    fn test_cudart_invalid_ignored() {
+        let builder = KernelBuilder::new().cudart("invalid_option");
+        assert_eq!(builder.cudart, None);
+    }
+
+    #[test]
+    fn test_cudart_target_validation() {
+        assert!(KernelBuilder::new()
+            .cudart("shared")
+            .validate_cudart_for_target(Some("x86_64-unknown-linux-gnu"))
+            .is_ok());
+        assert!(KernelBuilder::new()
+            .cudart("static")
+            .validate_cudart_for_target(Some("x86_64-pc-windows-msvc"))
+            .is_ok());
+        assert!(KernelBuilder::new()
+            .cudart("hybrid")
+            .validate_cudart_for_target(Some("x86_64-pc-windows-msvc"))
+            .is_ok());
+        assert!(KernelBuilder::new()
+            .cudart("shared")
+            .validate_cudart_for_target(Some("x86_64-pc-windows-msvc"))
+            .is_err());
+        assert!(KernelBuilder::new()
+            .cudart("hybrid")
+            .validate_cudart_for_target(Some("x86_64-unknown-linux-gnu"))
+            .is_err());
+    }
 
     #[test]
     fn test_incremental_rebuild_on_header_change() {
