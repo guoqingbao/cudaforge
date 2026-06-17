@@ -491,6 +491,8 @@ impl KernelBuilder {
                     command.arg("-Xcompiler").arg("-fPIC");
                 } else {
                     command.arg("-D_USE_MATH_DEFINES");
+                    // CUDA 13.x CCCL headers reject MSVC's traditional preprocessor.
+                    command.arg("-Xcompiler").arg("/Zc:preprocessor");
                 }
                 crt_args.add_to_command(&mut command);
                 if let Some(cudart) = &self.cudart {
@@ -601,6 +603,7 @@ impl KernelBuilder {
 
         let dep_args = self.dependencies.fetch_all(&self.out_dir)?;
         let ccbin_env = std::env::var("NVCC_CCBIN").ok();
+        let is_msvc = std::env::var("TARGET").is_ok_and(|t| t.contains("msvc"));
         let nvcc_threads = self.parallel.nvcc_threads();
         let watch_hash = hash_paths(self.sources.watch_paths());
         let mut cache = BuildCache::load(&self.out_dir);
@@ -673,6 +676,10 @@ impl KernelBuilder {
                     command
                         .arg("-allow-unsupported-compiler")
                         .args(["-ccbin", ccbin]);
+                }
+                // CUDA 13.x CCCL headers reject MSVC's traditional preprocessor.
+                if is_msvc {
+                    command.arg("-Xcompiler").arg("/Zc:preprocessor");
                 }
 
                 // Add nvcc threads for certain files
