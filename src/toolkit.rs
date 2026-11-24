@@ -89,6 +89,11 @@ impl CudaToolkit {
         })
     }
 
+    /// Major CUDA version (e.g. `13` for "13.2"), if the version was detected
+    pub fn major_version(&self) -> Option<u32> {
+        self.version.as_deref().and_then(parse_major_version)
+    }
+
     /// Get supported GPU architectures from nvcc
     pub fn supported_architectures(&self) -> Vec<usize> {
         let output = Command::new(&self.nvcc_path)
@@ -183,6 +188,11 @@ fn parse_gpu_codes(output: &str) -> Vec<usize> {
     codes
 }
 
+/// Parse the major component of a version string like "13.2"
+fn parse_major_version(version: &str) -> Option<u32> {
+    version.split('.').next()?.trim().parse().ok()
+}
+
 /// Detect CUDA version from nvcc
 fn detect_cuda_version(nvcc_path: &PathBuf) -> Option<String> {
     let output = Command::new(nvcc_path).arg("--version").output().ok()?;
@@ -212,5 +222,14 @@ mod tests {
         let codes = parse_gpu_codes(output);
         assert!(codes.contains(&80));
         assert!(codes.contains(&90));
+    }
+
+    #[test]
+    fn test_parse_major_version() {
+        assert_eq!(parse_major_version("13.2"), Some(13));
+        assert_eq!(parse_major_version("12.1"), Some(12));
+        assert_eq!(parse_major_version("13"), Some(13));
+        assert_eq!(parse_major_version(""), None);
+        assert_eq!(parse_major_version("abc"), None);
     }
 }

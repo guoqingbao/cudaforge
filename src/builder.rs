@@ -382,6 +382,8 @@ impl KernelBuilder {
         let ccbin_env = std::env::var("NVCC_CCBIN").ok();
         let target_features = std::env::var("CARGO_CFG_TARGET_FEATURE").ok();
         let crt_args = self.nvcc_crt_args(is_msvc, is_gnu_like, target_features.as_deref());
+        let conforming_preprocessor =
+            needs_conforming_preprocessor(is_msvc, toolkit.major_version());
 
         // Load build cache
         let mut cache = if self.incremental {
@@ -491,7 +493,8 @@ impl KernelBuilder {
                     command.arg("-Xcompiler").arg("-fPIC");
                 } else {
                     command.arg("-D_USE_MATH_DEFINES");
-                    // CUDA 13.x CCCL headers reject MSVC's traditional preprocessor.
+                }
+                if conforming_preprocessor {
                     command.arg("-Xcompiler").arg("/Zc:preprocessor");
                 }
                 crt_args.add_to_command(&mut command);
@@ -604,6 +607,8 @@ impl KernelBuilder {
         let dep_args = self.dependencies.fetch_all(&self.out_dir)?;
         let ccbin_env = std::env::var("NVCC_CCBIN").ok();
         let is_msvc = std::env::var("TARGET").is_ok_and(|t| t.contains("msvc"));
+        let conforming_preprocessor =
+            needs_conforming_preprocessor(is_msvc, toolkit.major_version());
         let nvcc_threads = self.parallel.nvcc_threads();
         let watch_hash = hash_paths(self.sources.watch_paths());
         let mut cache = BuildCache::load(&self.out_dir);
@@ -677,8 +682,7 @@ impl KernelBuilder {
                         .arg("-allow-unsupported-compiler")
                         .args(["-ccbin", ccbin]);
                 }
-                // CUDA 13.x CCCL headers reject MSVC's traditional preprocessor.
-                if is_msvc {
+                if conforming_preprocessor {
                     command.arg("-Xcompiler").arg("/Zc:preprocessor");
                 }
 
@@ -824,6 +828,12 @@ impl NvccCrtArgs {
     }
 }
 
+/// CUDA 13+ CCCL headers `#error` unless MSVC's host compiler runs with its
+/// standard-conforming preprocessor (`/Zc:preprocessor`).
+fn needs_conforming_preprocessor(is_msvc: bool, cuda_major: Option<u32>) -> bool {
+    is_msvc && cuda_major.is_some_and(|major| major >= 13)
+}
+
 fn target_features_contains_crt_static(target_features: Option<&str>) -> bool {
     target_features
         .unwrap_or_default()
@@ -911,6 +921,15 @@ mod tests {
             KernelBuilder::new().nvcc_crt_args(false, true, None),
             NvccCrtArgs { host_crt: None }
         );
+    }
+
+    #[test]
+    fn test_needs_conforming_preprocessor() {
+        assert!(needs_conforming_preprocessor(true, Some(13)));
+        assert!(needs_conforming_preprocessor(true, Some(14)));
+        assert!(!needs_conforming_preprocessor(true, Some(12)));
+        assert!(!needs_conforming_preprocessor(true, None));
+        assert!(!needs_conforming_preprocessor(false, Some(13)));
     }
 
     #[test]
