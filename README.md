@@ -286,6 +286,16 @@ Incremental builds are enabled by default. CudaForge tracks:
 - Compute capability used
 - Compiler arguments
 
+Hashing uses SHA-256 via the default `sha2` feature. To drop that dependency
+and use a built-in, faster, non-cryptographic 64-bit hash instead:
+
+```toml
+[build-dependencies]
+cudaforge = { version = "0.1", default-features = false }
+```
+
+Switching hashers invalidates existing cache entries, triggering one full rebuild.
+
 To disable:
 
 ```rust

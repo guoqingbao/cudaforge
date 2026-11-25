@@ -2,7 +2,8 @@
 
 use crate::error::{Error, Result};
 use serde::{Deserialize, Serialize};
-use sha2::{Digest, Sha256};
+#[cfg(feature = "sha2")]
+use sha2::{Digest, Sha256 as Hasher};
 use std::collections::HashMap;
 use std::fs;
 use std::io::Read;
@@ -24,7 +25,7 @@ pub struct BuildCache {
 /// Entry for a single source file
 #[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct CacheEntry {
-    /// SHA-256 hash of file content
+    /// Hash of file content
     pub content_hash: String,
     /// Combined hash of watched paths
     #[serde(default)]
@@ -177,10 +178,68 @@ fn source_path_from_key<'a>(key: &'a str, object_path: &str) -> Option<&'a str> 
     key.strip_suffix(&suffix)
 }
 
-/// Compute SHA-256 hash of a file's contents
+/// Non-cryptographic 64-bit hash used when the `sha2` feature is disabled.
+/// Its output is persisted in the cache file, so it must stay stable.
+#[cfg(not(feature = "sha2"))]
+struct Hasher {
+    state: u64,
+    len: u64,
+    tail: [u8; 8],
+}
+
+#[cfg(not(feature = "sha2"))]
+impl Hasher {
+    fn new() -> Self {
+        Self {
+            state: 0x243f_6a88_85a3_08d3,
+            len: 0,
+            tail: [0; 8],
+        }
+    }
+
+    fn mix(&mut self, word: [u8; 8]) {
+        let r = (self.state ^ u64::from_le_bytes(word)) as u128 * 0x9e37_79b9_7f4a_7c15;
+        self.state = r as u64 ^ (r >> 64) as u64;
+    }
+
+    fn update(&mut self, mut data: &[u8]) {
+        let pending = (self.len % 8) as usize;
+        self.len += data.len() as u64;
+        if pending > 0 {
+            let take = data.len().min(8 - pending);
+            self.tail[pending..pending + take].copy_from_slice(&data[..take]);
+            data = &data[take..];
+            if pending + take < 8 {
+                return;
+            }
+            self.mix(self.tail);
+        }
+        let (words, rest) = data.as_chunks::<8>();
+        for word in words {
+            self.mix(*word);
+        }
+        self.tail[..rest.len()].copy_from_slice(rest);
+    }
+
+    fn finalize(mut self) -> [u8; 8] {
+        let pending = (self.len % 8) as usize;
+        if pending > 0 {
+            self.tail[pending..].fill(0);
+            self.mix(self.tail);
+        }
+        self.mix(self.len.to_le_bytes());
+        self.state.to_be_bytes()
+    }
+}
+
+fn to_hex(bytes: &[u8]) -> String {
+    bytes.iter().map(|b| format!("{:02x}", b)).collect()
+}
+
+/// Compute the content hash of a file
 pub fn hash_file(path: &Path) -> Result<String> {
     let mut file = fs::File::open(path)?;
-    let mut hasher = Sha256::new();
+    let mut hasher = Hasher::new();
     let mut buffer = [0u8; 8192];
 
     loop {
@@ -191,22 +250,22 @@ pub fn hash_file(path: &Path) -> Result<String> {
         hasher.update(&buffer[..bytes_read]);
     }
 
-    Ok(format!("{:x}", hasher.finalize()))
+    Ok(to_hex(&hasher.finalize()))
 }
 
 /// Hash a list of arguments for cache comparison
 pub fn hash_args(args: &[String]) -> String {
-    let mut hasher = Sha256::new();
+    let mut hasher = Hasher::new();
     for arg in args {
         hasher.update(arg.as_bytes());
         hasher.update(b"\0");
     }
-    format!("{:x}", hasher.finalize())
+    to_hex(&hasher.finalize())
 }
 
 /// Compute a combined hash of multiple paths (files or directories)
 pub fn hash_paths(paths: &[PathBuf]) -> String {
-    let mut hasher = Sha256::new();
+    let mut hasher = Hasher::new();
 
     // Sort paths to ensure deterministic hashing
     let mut sorted_paths = paths.to_vec();
@@ -248,7 +307,7 @@ pub fn hash_paths(paths: &[PathBuf]) -> String {
         }
     }
 
-    format!("{:x}", hasher.finalize())
+    to_hex(&hasher.finalize())
 }
 
 /// Check if output file is newer than all input files
